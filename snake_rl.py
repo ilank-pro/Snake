@@ -11,23 +11,23 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         # Dueling DQN architecture: shared feature layers
         self.feature = nn.Sequential(
-            nn.Linear(input_size, 512),
+            nn.Linear(input_size, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.ReLU()
         )
         # Value stream
         self.value_stream = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(64, 1)
         )
         # Advantage stream
         self.adv_stream = nn.Sequential(
-            nn.Linear(256, 128),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(128, output_size)
+            nn.Linear(64, output_size)
         )
 
     def forward(self, x):
