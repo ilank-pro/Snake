@@ -15,6 +15,12 @@ GRID_SIZE = 20
 GRID_WIDTH = WINDOW_SIZE // GRID_SIZE
 GRID_HEIGHT = WINDOW_SIZE // GRID_SIZE
 
+# Directions
+UP = (0, -1)
+DOWN = (0, 1)
+LEFT = (-1, 0)
+RIGHT = (1, 0)
+
 # Colors
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -54,7 +60,7 @@ class Snake:
         
         if rl_agent:
             # Use RL agent for movement
-            state = rl_agent.get_state(self, food_pos, other_snake_body, obstacles, GRID_WIDTH)
+            state = get_state(self, Snake(0, 0, BLUE), food_pos, obstacles)  # Create dummy opponent snake
             action = rl_agent.act(state)
             directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # up, right, down, left
             self.direction = directions[action]
@@ -118,73 +124,135 @@ def draw_grid():
     for y in range(0, WINDOW_SIZE, GRID_SIZE):
         pygame.draw.line(screen, GRAY, (0, y), (WINDOW_SIZE, y))
 
-def train_rl_agent(episodes=500):
-    state_size = 16  # 4 danger + 4 direction + 2 food distance + 4 wall distances + 2 snake lengths
-    action_size = 4  # up, right, down, left
-    agent = RLAgent(state_size, action_size)
-    batch_size = 64  # Increased batch size
-    max_steps = 2000  # Maximum steps per episode
+def is_collision(pos: Tuple[int, int], snake1_body: List[Tuple[int, int]], snake2_body: List[Tuple[int, int]], obstacles: List[Tuple[int, int]]) -> bool:
+    """Check if a position collides with snake bodies or obstacles"""
+    x, y = pos
+    # Check if position is out of bounds
+    if x < 0 or x >= GRID_WIDTH or y < 0 or y >= GRID_HEIGHT:
+        return True
+    # Check collision with snake bodies and obstacles
+    return pos in snake1_body or pos in snake2_body or pos in obstacles
+
+def get_state(snake1, snake2, food_pos, obstacles):
+    """Get state representation with prioritized features"""
+    state = []
     
-    # Training statistics
+    # 1. Food position relative to snake1 (4 features)
+    dx = food_pos[0] - snake1.body[0][0]
+    dy = food_pos[1] - snake1.body[0][1]
+    state.extend([dx / GRID_WIDTH, dy / GRID_HEIGHT, 
+                 abs(dx) / GRID_WIDTH, abs(dy) / GRID_HEIGHT])
+    
+    # 2. Snake1's direction (4 features)
+    state.extend([1 if snake1.direction == d else 0 for d in [UP, DOWN, LEFT, RIGHT]])
+    
+    # 3. Immediate danger detection (4 features)
+    head = snake1.body[0]
+    state.extend([
+        1 if is_collision((head[0], head[1] - 1), snake1.body[1:], snake2.body, obstacles) else 0,  # Up
+        1 if is_collision((head[0], head[1] + 1), snake1.body[1:], snake2.body, obstacles) else 0,  # Down
+        1 if is_collision((head[0] - 1, head[1]), snake1.body[1:], snake2.body, obstacles) else 0,  # Left
+        1 if is_collision((head[0] + 1, head[1]), snake1.body[1:], snake2.body, obstacles) else 0   # Right
+    ])
+    
+    # 4. Distance to opponent's head (2 features)
+    opp_head = snake2.body[0]
+    state.extend([
+        (opp_head[0] - head[0]) / GRID_WIDTH,
+        (opp_head[1] - head[1]) / GRID_HEIGHT
+    ])
+    
+    # 5. Length comparison (1 feature)
+    state.append(1 if len(snake1.body) > len(snake2.body) else 0)
+    
+    # 6. Food availability (1 feature)
+    state.append(1 if food_pos else 0)
+    
+    return np.array(state, dtype=np.float32)
+
+def train_rl_agent(episodes=2000, batch_size=128, max_steps=2000):
+    """Train the RL agent with improved parameters and curriculum"""
+    agent = RLAgent(
+        state_size=16,  # Matches the actual number of features in get_state
+        action_size=4
+    )
+    
+    best_score = -float('inf')
     scores = []
-    epsilon_history = []
+    avg_scores = []
+    epsilons = []
+    total_rewards = []
     
+    # Enhanced curriculum learning
     for episode in range(episodes):
-        snake1 = Snake(GRID_WIDTH//4, GRID_HEIGHT//2, BLUE)
-        snake2 = Snake(3*GRID_WIDTH//4, GRID_HEIGHT//2, GREEN)
+        # Initialize game state
+        snake1 = Snake(GRID_WIDTH // 4, GRID_HEIGHT // 2, GREEN)
+        snake2 = Snake(3 * GRID_WIDTH // 4, GRID_HEIGHT // 2, BLUE)
         obstacles = []
         food_pos = spawn_food(snake1.body, snake2.body, obstacles)
         last_obstacle_time = time.time()
         
-        state = agent.get_state(snake1, food_pos, snake2.body, obstacles, GRID_WIDTH)
+        # Adjust obstacle spawn rate based on episode
+        if episode < 200:  # First 200 episodes: no obstacles
+            obstacle_interval = float('inf')
+        elif episode < 400:  # Next 200 episodes: sparse obstacles
+            obstacle_interval = 45
+        elif episode < 600:  # Next 200 episodes: moderate obstacles
+            obstacle_interval = 30
+        else:  # Regular obstacles
+            obstacle_interval = 15
+        
+        state = get_state(snake1, snake2, food_pos, obstacles)
         total_reward = 0
         steps = 0
-        last_distance = abs(snake1.body[0][0] - food_pos[0]) + abs(snake1.body[0][1] - food_pos[1])
+        food_eaten = 0
         
         while snake1.alive and snake2.alive and steps < max_steps:
             steps += 1
             
-            # Spawn new obstacle every 3 seconds
-            current_time = time.time()
-            if current_time - last_obstacle_time >= 3:
-                new_obstacle = spawn_obstacle(snake1.body, snake2.body, obstacles)
-                obstacles.append(new_obstacle)
-                last_obstacle_time = current_time
+            # Spawn obstacles based on curriculum schedule
+            if obstacle_interval != float('inf'):
+                current_time = time.time()
+                if current_time - last_obstacle_time >= obstacle_interval:
+                    new_obstacle = spawn_obstacle(snake1.body, snake2.body, obstacles)
+                    obstacles.append(new_obstacle)
+                    last_obstacle_time = current_time
 
             # Move snakes
             food_eaten1 = snake1.move(food_pos, snake2.body, obstacles, agent)
             food_eaten2 = snake2.move(food_pos, snake1.body, obstacles)
 
-            # Calculate reward
-            reward = 0
+            # Calculate enhanced reward structure
+            reward = -0.01  # Smaller penalty per step to encourage exploration
             
-            # Distance-based reward
-            current_distance = abs(snake1.body[0][0] - food_pos[0]) + abs(snake1.body[0][1] - food_pos[1])
-            if current_distance < last_distance:
-                reward += 0.1  # Reward for moving closer to food
-            elif current_distance > last_distance:
-                reward -= 0.1  # Small penalty for moving away from food
-            last_distance = current_distance
-            
-            # Food rewards
+            # Food-related rewards
             if food_eaten1:
-                reward += 20  # Increased food reward
-            elif food_eaten2:
-                reward -= 5   # Penalty if opponent gets food
+                reward += 5.0  # Reduced food reward
+                # Additional reward for efficient path to food
+                if steps < max_steps * 0.5:  # If food was eaten quickly
+                    reward += 2.0
             
             # Survival rewards
+            if snake1.alive:
+                reward += 0.05  # Small reward for staying alive
+                # Bonus for maintaining distance from opponent
+                head1 = snake1.body[0]
+                head2 = snake2.body[0]
+                distance = abs(head1[0] - head2[0]) + abs(head1[1] - head2[1])
+                if distance > GRID_WIDTH // 2:  # If maintaining good distance
+                    reward += 0.1
+            
+            # Death penalties
             if not snake1.alive:
-                reward -= 100  # Increased death penalty
+                reward -= 5.0  # Reduced death penalty
             elif not snake2.alive:
-                reward += 100  # Increased survival reward
-            elif steps >= max_steps:
-                reward += 50   # Reward for surviving full episode
+                reward += 2.5  # Reduced opponent death bonus
             
             # Get new state
-            next_state = agent.get_state(snake1, food_pos, snake2.body, obstacles, GRID_WIDTH)
+            next_state = get_state(snake1, snake2, food_pos, obstacles)
             
             # Store experience
-            done = not snake1.alive or steps >= max_steps
+            done = not snake1.alive or not snake2.alive or steps >= max_steps
             agent.remember(state, agent.act(state), reward, next_state, done)
             
             state = next_state
@@ -193,22 +261,58 @@ def train_rl_agent(episodes=500):
             # Spawn new food if eaten
             if food_eaten1 or food_eaten2:
                 food_pos = spawn_food(snake1.body, snake2.body, obstacles)
+                food_eaten = 1
 
-            # Train on batch
-            if len(agent.memory) >= batch_size:
+            # Train on batch once warm-up buffer is filled
+            if len(agent.memory) >= max(batch_size, 1000):  # Warm-up until 1000 experiences
                 agent.replay(batch_size)
 
         # Store statistics
         scores.append(snake1.score)
-        epsilon_history.append(agent.epsilon)
+        avg_scores.append(np.mean(scores[-100:]) if len(scores) >= 100 else np.mean(scores))
+        epsilons.append(agent.epsilon)
+        total_rewards.append(total_reward)
         
-        # Print progress
-        avg_score = np.mean(scores[-100:]) if len(scores) >= 100 else np.mean(scores)
-        print(f"Episode: {episode+1}/{episodes}, Score: {snake1.score}, Avg Score: {avg_score:.2f}, "
-              f"Steps: {steps}, Epsilon: {agent.epsilon:.3f}, Total Reward: {total_reward:.2f}")
+        # Save best model
+        if snake1.score > best_score:
+            best_score = snake1.score
+            agent.save("snake_model_best.pth")
+        
+        # Print detailed progress
+        print(f"\nEpisode: {episode+1}/{episodes}")
+        print(f"Score: {snake1.score}")
+        print(f"Best Score: {best_score}")
+        print(f"Average Score (last 100): {avg_scores[-1]:.2f}")
+        print(f"Steps: {steps}")
+        print(f"Epsilon: {agent.epsilon:.3f}")
+        print(f"Total Reward: {total_reward:.2f}")
+        
+        # Print learning progress every 50 episodes
+        if (episode + 1) % 50 == 0:
+            print("\nLearning Progress:")
+            print(f"Last 50 episodes average score: {np.mean(scores[-50:]):.2f}")
+            print(f"Epsilon decay: {epsilons[-50]:.3f} -> {epsilons[-1]:.3f}")
+            print(f"Average total reward: {np.mean(total_rewards[-50:]):.2f}")
+        
+        # Save checkpoint every 100 episodes
+        if (episode + 1) % 100 == 0:
+            agent.save(f"snake_model_checkpoint_{episode+1}.pth")
+            # Step learning rate scheduler for gradual decay
+            try:
+                agent.scheduler.step()
+            except AttributeError:
+                pass
     
-    # Save the trained model
+    # Save the final model
     agent.save("snake_model.pth")
+    
+    # Print final statistics
+    print("\nTraining Summary:")
+    print(f"Final Average Score: {np.mean(scores):.2f}")
+    print(f"Best Score Achieved: {best_score}")
+    print(f"Final Epsilon: {agent.epsilon:.3f}")
+    print(f"Average Total Reward: {np.mean(total_rewards):.2f}")
+    
     return agent
 
 def main():

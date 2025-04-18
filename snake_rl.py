@@ -4,33 +4,91 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 import random
+import torch.nn.functional as F
 
 class DQN(nn.Module):
     def __init__(self, input_size, output_size):
         super(DQN, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 256),
+        # Dueling DQN architecture: shared feature layers
+        self.feature = nn.Sequential(
+            nn.Linear(input_size, 512),
             nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        # Value stream
+        self.value_stream = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(128, 1)
+        )
+        # Advantage stream
+        self.adv_stream = nn.Sequential(
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, output_size)
+            nn.Linear(128, output_size)
         )
 
     def forward(self, x):
-        return self.network(x)
+        features = self.feature(x)
+        values = self.value_stream(features)
+        advantages = self.adv_stream(features)
+        # Combine streams: Q(s,a) = V(s) + A(s,a) - mean(A(s,*))
+        q_vals = values + (advantages - advantages.mean(dim=1, keepdim=True))
+        return q_vals
+
+## Add Prioritized Replay buffer implementation
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.priorities = []
+        self.pos = 0
+
+    def __len__(self):  # Allow len(buffer)
+        return len(self.buffer)
+
+    def push(self, transition):
+        max_prio = max(self.priorities) if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+            self.priorities.append(max_prio)
+        else:
+            self.buffer[self.pos] = transition
+            self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size, beta):
+        prios = np.array(self.priorities)
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[i] for i in indices]
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        return samples, indices, weights
+
+    def update_priorities(self, indices, priorities):
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = prio
 
 class RLAgent:
     def __init__(self, state_size, action_size):
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=100000)  # Increased memory size
-        self.gamma = 0.99  # Increased discount factor
+        # Prioritized replay memory
+        self.memory = PrioritizedReplayBuffer(capacity=100000, alpha=0.6)
+        self.beta = 0.4  # initial importance-sampling weight exponent
+        self.beta_increment = (1.0 - self.beta) / 100000
+        
+        self.gamma = 0.99  # Focus on long-term
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.997  # Slower decay
-        self.learning_rate = 0.0005  # Reduced learning rate
+        self.epsilon_min = 0.05  # Higher minimum epsilon for ongoing exploration
+        self.epsilon_decay = 0.999  # Slow decay for exploration stability
+        self.learning_rate = 0.0005 # Moderate learning rate
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Main network and target network
@@ -39,11 +97,12 @@ class RLAgent:
         self.update_target_model()
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.criterion = nn.MSELoss()
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.9)
+        self.criterion = nn.HuberLoss()
         
         # For double DQN
         self.target_update_counter = 0
-        self.target_update_frequency = 10
+        self.target_update_frequency = 10 # Moderate update frequency
 
     def update_target_model(self):
         self.target_model.load_state_dict(self.model.state_dict())
@@ -51,32 +110,38 @@ class RLAgent:
     def get_state(self, snake, food_pos, other_snake_body, obstacles, grid_size):
         head = snake.body[0]
         
-        # Distance to food
-        food_x_dist = (food_pos[0] - head[0]) / grid_size
-        food_y_dist = (food_pos[1] - head[1]) / grid_size
+        # Normalized positions
+        head_x = head[0] / grid_size
+        head_y = head[1] / grid_size
+        food_x = food_pos[0] / grid_size
+        food_y = food_pos[1] / grid_size
         
-        # Distance to walls
-        wall_dist_left = head[0] / grid_size
-        wall_dist_right = (grid_size - head[0]) / grid_size
-        wall_dist_up = head[1] / grid_size
-        wall_dist_down = (grid_size - head[1]) / grid_size
+        # Direction to food (normalized)
+        dx = (food_x - head_x)
+        dy = (food_y - head_y)
         
-        # Danger in each direction (up, right, down, left)
+        # Distance to walls (normalized)
+        wall_dist_left = head_x
+        wall_dist_right = 1 - head_x
+        wall_dist_up = head_y
+        wall_dist_down = 1 - head_y
+        
+        # Danger detection with multiple ranges
         directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
         danger = []
-        vision_range = 3  # Look ahead 3 cells
+        vision_ranges = [1, 2, 3]
         
-        for dx, dy in directions:
+        for dx_dir, dy_dir in directions:
             danger_level = 0
-            for i in range(1, vision_range + 1):
-                check_x = (head[0] + dx * i) % grid_size
-                check_y = (head[1] + dy * i) % grid_size
+            for range_idx, vision_range in enumerate(vision_ranges):
+                check_x = (head[0] + dx_dir * vision_range) % grid_size
+                check_y = (head[1] + dy_dir * vision_range) % grid_size
                 check_pos = (check_x, check_y)
                 
                 if (check_pos in snake.body[1:] or 
                     check_pos in other_snake_body or 
                     check_pos in obstacles):
-                    danger_level = 1 - (i - 1) / vision_range
+                    danger_level = 1 - (range_idx / len(vision_ranges))
                     break
             danger.append(danger_level)
         
@@ -85,20 +150,21 @@ class RLAgent:
         dir_idx = directions.index(snake.direction)
         dir_vec[dir_idx] = 1
         
-        # Length of both snakes
+        # Snake lengths (normalized)
         self_length = len(snake.body) / grid_size
         other_length = len(other_snake_body) / grid_size
         
-        # Combine all features
-        state = (danger + dir_vec + 
-                [food_x_dist, food_y_dist] + 
-                [wall_dist_left, wall_dist_right, wall_dist_up, wall_dist_down] +
-                [self_length, other_length])
+        # Combine all features (state_size should be 20)
+        state = ([head_x, head_y, food_x, food_y, dx, dy] +  # 6 features
+                danger +  # 4 features
+                dir_vec +  # 4 features
+                [wall_dist_left, wall_dist_right, wall_dist_up, wall_dist_down] +  # 4 features
+                [self_length, other_length])  # 2 features
         
-        return np.array(state)
+        return np.array(state, dtype=np.float32)
 
     def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
+        self.memory.push((state, action, reward, next_state, done))
 
     def act(self, state, training=True):
         if training and random.random() < self.epsilon:
@@ -110,15 +176,27 @@ class RLAgent:
             return q_values.argmax().item()
 
     def replay(self, batch_size):
-        if len(self.memory) < batch_size:
+        if len(self.memory.buffer) < batch_size:
             return
         
-        minibatch = random.sample(self.memory, batch_size)
-        states = torch.FloatTensor([t[0] for t in minibatch]).to(self.device)
-        actions = torch.LongTensor([t[1] for t in minibatch]).to(self.device)
-        rewards = torch.FloatTensor([t[2] for t in minibatch]).to(self.device)
-        next_states = torch.FloatTensor([t[3] for t in minibatch]).to(self.device)
-        dones = torch.FloatTensor([t[4] for t in minibatch]).to(self.device)
+        # Sample from prioritized memory
+        minibatch, indices, weights = self.memory.sample(batch_size, beta=self.beta)
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        states, actions, rewards, next_states, dones = zip(*minibatch)
+        states = np.array(states)
+        actions = np.array(actions)
+        rewards = np.array(rewards)
+        next_states = np.array(next_states)
+        dones = np.array(dones)
+        weights = np.array(weights)
+
+        # Convert to tensors
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.LongTensor(actions).to(self.device)
+        rewards = torch.FloatTensor(rewards).to(self.device)
+        next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
+        weights = torch.FloatTensor(weights).unsqueeze(1).to(self.device)
 
         # Double DQN
         current_q_values = self.model(states).gather(1, actions.unsqueeze(1))
@@ -126,12 +204,17 @@ class RLAgent:
         next_q_values = self.target_model(next_states).gather(1, next_actions.unsqueeze(1)).squeeze()
         target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
-        loss = self.criterion(current_q_values.squeeze(), target_q_values)
+        # Compute per-sample loss
+        loss_elements = F.smooth_l1_loss(current_q_values.squeeze(), target_q_values, reduction='none')
+        # Update priorities
+        new_prios = loss_elements.detach().cpu().numpy() + 1e-6
+        self.memory.update_priorities(indices, new_prios)
+        # Weighted loss
+        loss = (weights * loss_elements.unsqueeze(1)).mean()
         
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # Keep gradient clipping at 1.0
         self.optimizer.step()
 
         # Update target network
@@ -152,7 +235,7 @@ class RLAgent:
         }, path)
 
     def load(self, path):
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, map_location=self.device) # Added map_location
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.target_model.load_state_dict(checkpoint['target_model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
